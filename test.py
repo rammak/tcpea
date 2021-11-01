@@ -1,6 +1,7 @@
 import unittest
-import main
 import socket
+from tcpea import *
+from tcpea_common import *
 
 
 class TestSum(unittest.TestCase):
@@ -8,7 +9,7 @@ class TestSum(unittest.TestCase):
                0xa8, 0x00, 0xc7])
 
     def test_checksum(self):
-        self.assertEqual(main.ipv4_checksum(self.b), 47201, "Should be b861")
+        self.assertEqual(ipv4_checksum(self.b), 47201, "Should be b861")
 
     def test_ip_maker(self):
         payload = bytes([0xcd, 0x34, 0x01, 0xbb, 0x1e, 0xd7, 0x82, 0x34,
@@ -19,9 +20,9 @@ class TestSum(unittest.TestCase):
         header = bytes([0x45, 0x00, 0x00, 0x40, 0x6d, 0x70, 0x40, 0x00,
                         0x40, 0x06, 0xbe, 0x10, 0xc0, 0xa8, 0xec, 0x84,
                         0x68, 0x10, 0xf9, 0xf9])
-        out = main.ip_packet.to_raw(main.ipv4_address.from_str("192.168.236.132"),
-                                               main.ipv4_address.from_str("104.16.249.249"),
-                                               payload, id=0x6d70, fl_df=True, ttl=64)
+        out = ip_packet.to_raw(ipv4_address.from_str("192.168.236.132"),
+                               ipv4_address.from_str("104.16.249.249"),
+                               payload, id=0x6d70, fl_df=True, ttl=64)
         for i in range(len(out)):
             print(hex(out[i]), end=" ")
         self.assertEqual(out[:20], header, "IP header check failed")
@@ -34,13 +35,14 @@ class TestSum(unittest.TestCase):
                         0x7a, 0x54, 0x30, 0xcf, 0x50, 0x18, 0xf5, 0x3c,
                         0xca, 0x6a, 0x00, 0x00])
         print('\n'+str([0x4694b227 >> 24, 0x4694b227 >> 16, 0x4694b227 >> 8, 0x4694b227 & 0xff,]))
-        out = main.tcp_packet.to_raw(main.ipv4_address.from_str("192.168.236.132"),
-                                     main.ipv4_address.from_str("104.16.249.249"), src_port=52532, dst_port=443,
-                                     seq_no=517440052, ack_no=2052337871, fl_ack=True, fl_push=True, window=0xf53c,
-                                     payload=payload)
+        out = tcp_packet.to_raw(ipv4_address.from_str("192.168.236.132"),
+                                ipv4_address.from_str("104.16.249.249"), src_port=52532, dst_port=443,
+                                seq_no=517440052, ack_no=2052337871, fl_ack=True, fl_push=True, window=0xf53c,
+                                payload=payload)
         for i in range(len(out)):
             print(hex(out[i]), end=" ")
         self.assertEqual(out[:20], header, "TCP header check failed")
+
 
     def xxx_test_send(self):
         packet = [0x00, 0x50, 0x56, 0xe6, 0x9c, 0xc0, 0x00, 0x0c,
@@ -58,6 +60,7 @@ class TestSum(unittest.TestCase):
                   0x36, 0x37]
         s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
         print(s.send(bytes(packet)))
+
 
 if __name__ == '__main__':
     unittest.main()
