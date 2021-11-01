@@ -1,4 +1,11 @@
+"""Creates a TCP connection to a server
 
+Usage:
+    ./main.py -a 192.168.0.7 -p 1234
+
+Author:
+    Rutwij Makwana - 30 Oct 2021
+"""
 
 import signal
 import sys
@@ -7,6 +14,7 @@ from tcpea import *
 
 
 def signal_handler(sig, frame):
+    # todo: graceful exit
     sock.close()
     sys.exit(0)
 

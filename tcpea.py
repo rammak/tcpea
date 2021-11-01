@@ -1,3 +1,9 @@
+"""tcpea core classes
+
+Author:
+    Rutwij Makwana - 31 Oct 2021
+"""
+
 import random
 import enum
 import queue

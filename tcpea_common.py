@@ -1,3 +1,9 @@
+"""tcpea helper functions
+
+Author:
+    Rutwij Makwana - 31 Oct 2021
+"""
+
 import socket
 
 
