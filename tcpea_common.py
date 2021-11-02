@@ -62,7 +62,11 @@ def send_to(soc: socket.socket, ip: ipv4_address, port: int, data: bytes):
 
 def receive_from(soc: socket.socket, ip: ipv4_address):
     while True:
-        pac = soc.recvfrom(65565)
-        # print(pac[1])
-        if pac[1][0] == ip.to_str():
-            return pac[0]
+        try:
+            pac = soc.recvfrom(65565)
+            # print(pac[1])
+            if pac[1][0] == ip.to_str() or ip.to_str() == "0.0.0.0":
+                # print("returning ", pac)
+                return pac[0]
+        except socket.timeout:
+            pass

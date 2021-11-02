@@ -33,6 +33,8 @@ class app_state(enum.Enum):
     PASSIVE_OPEN = 2
     LISTEN = 3
 
+class REMOTE_CLOSED(Exception):
+    pass
 
 class ip_packet:
     src_ip: ipv4_address = None
@@ -120,6 +122,7 @@ class tcp_packet:
     def to_raw(cls, src_ip: ipv4_address, dst_ip: ipv4_address, src_port: int, dst_port: int, seq_no: int, ack_no: int,
                window: int, payload: bytes, fl_ack: bool = False, fl_syn: bool = False, fl_rst: bool = False,
                fl_fin: bool = False, fl_push: bool = False, opt_mss=None, opt_wscale=None):
+        print("hsh ", src_ip.to_str(), dst_ip.to_str())
         header_length = 5
         options = []
         if opt_wscale is not None:
@@ -149,6 +152,7 @@ class tcp_packet:
 
 
 class tcpea:
+    server: bool = False
     state: tcp_state = tcp_state.CLOSED
     app: app_state = app_state.CLOSE
     dst_ip: ipv4_address = None
@@ -160,33 +164,38 @@ class tcpea:
     ack: int = 0
     s_buffer: queue.Queue = None
     r_buffer: queue.Queue = None
+    remote_conn: bool = False
 
     __th: threading.Thread = None
     __tw_th: threading.Thread = None
     __l: threading.Lock = threading.Lock()
     __l1: threading.Lock = threading.Lock()
 
-    def __init__(self, dst_ip_address: ipv4_address, dst_port: int, src_ip_address: ipv4_address, src_port: int,
-                 soc: socket.socket, send_buffer: int = 3000, receive_buffer: int = 3000):
-        self.dst_ip = dst_ip_address
-        self.dst_port = dst_port
+    def __init__(self, src_ip_address: ipv4_address, send_buffer: int = 3000, receive_buffer: int = 3000):
         self.src_ip = src_ip_address
-        self.src_port = src_port
-        self.soc = soc
         self.s_buffer = queue.Queue(send_buffer)
         self.r_buffer = queue.Queue(receive_buffer)
         self.__th = threading.Thread(target=self.loop)
         self.__tw_th = threading.Thread(target=self.__time_wait)
 
+        self.soc = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        self.soc.settimeout(1)
+
     def __del__(self):
         if self.soc is not None:
             self.soc.close()
 
-    def connect(self):
-        # print("Inside connect")
+    def bind(self, port: int):
+        self.src_port = port
+
+    def connect(self, dst_ip_address: ipv4_address, dst_port: int, src_port: int):
+        self.dst_ip = dst_ip_address
+        self.dst_port = dst_port
+        self.src_port = src_port
         if not self.__th.is_alive():
             self.__th.start()
         self.__l.acquire()
+        self.app = app_state.ACTIVE_OPEN
         try:
             self.__send_flag(fl_syn=True)
             self.app = app_state.ACTIVE_OPEN
@@ -196,15 +205,16 @@ class tcpea:
 
     def send(self, data: bytes):
         if self.state == tcp_state.ESTABLISHED:
-            # todo: send from buffer
-            data_tcp = tcp_packet.to_raw(src_ip=self.src_ip, src_port=self.src_port, dst_ip=self.dst_ip,
-                                         dst_port=self.dst_port, seq_no=self.seq, ack_no=self.ack, window=0xfaf0,
-                                         fl_ack=True, payload=bytes(data))
-            send_to(self.soc, ip=self.dst_ip, port=self.dst_port, data=data_tcp)
-            self.seq += len(data)
+            self.s_buffer.put(data)
             return len(data)
         else:
             return 0
+
+    def receive(self):
+        if self.r_buffer.empty() is False:
+            return self.r_buffer.get()
+        else:
+            return False
 
     def close(self):
         self.__l.acquire()
@@ -214,90 +224,177 @@ class tcpea:
         finally:
             self.__l.release()
 
-    def listen(self):
-        pass
+    def listen(self, port: int):
+        self.server = True
+        self.dst_ip = ipv4_address.from_str("0.0.0.0")
+        self.src_port = port
+        self.app = app_state.LISTEN
+        if self.state == tcp_state.CLOSED:
+            self.__goto_state(tcp_state.LISTEN)
+            if not self.__th.is_alive():
+                self.__th.start()
+            self.__l.acquire()
+            return True
+        else:
+            return False
+
+    def accept(self):
+        if self.remote_conn:
+            return self.dst_ip, self.dst_port
+        else:
+            return None
 
     def loop(self):
         while True:
             r = receive_from(self.soc, self.dst_ip)
-            # print("Received frame: ", end="")
-            # print_packet(r)
+
+            # if application has closed, close connection gracefully
+            if self.app == app_state.CLOSE and self.state == tcp_state.TIME_WAIT or self.state == tcp_state.LAST_ACK:
+                return
+            # filter empty returns because of a timeout
+            if len(r) == 0:
+                continue
+
             rp = tcp_packet.from_raw(r[20:])
             # todo: check for checksum
             if rp.dst_port != self.src_port:
                 # print("Wrong port ", rp.dst_port, self.src_port)
                 continue
+
+            # --------TCP STATE MACHINE----------
             if self.state == tcp_state.CLOSED:
                 # todo: this send throws permission denied
                 # self.__send_reset()
                 continue
                 # add passive open
+
+            elif self.state == tcp_state.LISTEN:
+                if rp.fl_syn:
+                    ip_pac = ip_packet.from_raw(r)
+                    self.dst_ip = ip_pac.src_ip
+                    self.dst_port = rp.src_port
+                    print(self.src_ip, self.src_port, self.dst_ip, self.dst_port)
+                    self.seq = random.randint(0, 0xffffffff)
+                    self.ack = rp.seq_no + 1
+                    self.__send_flag(fl_syn=True, fl_ack=True)
+                    self.app = app_state.PASSIVE_OPEN
+                    self.__goto_state(tcp_state.SYN_RECEIVED)
+
+            elif self.state == tcp_state.SYN_RECEIVED:
+                if self.app == app_state.CLOSE:
+                    self.__send_flag(fl_fin=True, fl_ack=True)
+                elif rp.fl_rst:
+                    self.__goto_state(tcp_state.LISTEN)
+                elif rp.fl_ack and rp.ack_no == self.seq + 1:
+                    self.__goto_state(tcp_state.ESTABLISHED)
+                    self.remote_conn = True
+                else:
+                    self.__goto_state(tcp_state.CLOSED)
+                    self.__send_reset()
+                    break
+
             elif self.state == tcp_state.SYN_SENT:
-                print("In state SYN_SENT")
-                # handle application close
-                if rp.fl_syn & rp.fl_ack:
+                if self.app == app_state.CLOSE:
+                    self.__goto_state(tcp_state.CLOSED)
+                    self.__send_reset()
+                elif (rp.fl_syn and rp.fl_ack) and rp.ack_no == self.seq + 1:
                     self.ack = rp.seq_no + 1
                     self.seq += 1
                     self.__send_flag(fl_ack=True)
                     self.__goto_state(tcp_state.ESTABLISHED)
-                    continue
+                elif rp.fl_syn:
+                    self.ack = rp.seq_no + 1
+                    self.seq += 1
+                    self.__send_flag(fl_syn=True, fl_ack=True)
+                    self.__goto_state(tcp_state.SYN_RECEIVED)
                 else:
+                    self.__goto_state(tcp_state.CLOSED)
                     self.__send_reset()
+                    break
+
             elif self.state == tcp_state.ESTABLISHED:
-                if not self.__check_valid(rp):
-                    self.__send_reset()
+                # self.dst_ip = rp.src_ip
+                # if rp.ack_no != self.seq:
+                #     # todo: handle retransmissions here
+                #     self.__send_reset()
+                #     self.__goto_state(tcp_state.CLOSED)
+                #     break
+                if rp.fl_rst:
                     self.__goto_state(tcp_state.CLOSED)
-                    continue
-                elif rp.fl_rst:
-                    self.__goto_state(tcp_state.CLOSED)
-                    continue
+                    break
+
                 # passive close
                 elif rp.fl_fin:
                     self.ack += 1
                     self.__send_flag(fl_ack=True)
                     self.__goto_state(tcp_state.CLOSE_WAIT)
-                    # todo: handle app close
-                    continue
+
                 # active close
                 elif self.app == app_state.CLOSE:
                     self.__send_flag(fl_fin=True, fl_ack=True)
                     self.__goto_state(tcp_state.FIN_WAIT_1)
-                    continue
-                else:
+
+                elif rp.ack_no == self.seq + 1:
                     self.ack += len(rp.payload)
-                    if(len(rp.payload) != 0):
+                    if len(rp.payload) != 0:
                         self.__send_flag(fl_ack=True)
-                    print(rp.payload.decode(encoding="UTF-8"), end="")
+                    self.r_buffer.put(rp.payload)
+                    # print(rp.payload.decode(encoding="UTF-8"), end="")
+                else:
+                    self.__goto_state(tcp_state.CLOSED)
+                    self.__send_reset()
+                    break
+
+                if not self.s_buffer.empty():
+                    print("S buffer not empty")
+                    self.ack = rp.seq_no + 1
+                    data_tcp = tcp_packet.to_raw(src_ip=self.src_ip, src_port=self.src_port, dst_ip=self.dst_ip,
+                                                 dst_port=self.dst_port, seq_no=self.seq, ack_no=self.ack,
+                                                 window=0xfaf0,
+                                                 fl_ack=True, payload=self.s_buffer.get())
+                    send_to(self.soc, ip=self.dst_ip, port=self.dst_port, data=data_tcp)
+
             elif self.state == tcp_state.FIN_WAIT_1:
                 if rp.fl_fin:
                     self.ack += 1
                     self.__send_flag(fl_ack=True)
                     self.__goto_state(tcp_state.CLOSING)
-                    continue
                 elif rp.fl_ack:
                     # wait for the remote app to close
                     self.__goto_state(tcp_state.FIN_WAIT_2)
-                    continue
                 elif rp.fl_ack and rp.fl_fin:
-                    self.seq += 1
+                    self.ack += 1
                     self.__send_flag(fl_ack=True)
                     self.__goto_state(tcp_state.TIME_WAIT)
+                else:
+                    self.__goto_state(tcp_state.CLOSED)
+                    self.__send_reset()
                     break
+
             elif self.state == tcp_state.FIN_WAIT_2:
                 if rp.fl_fin:
                     self.seq = rp.ack_no
                     self.ack += 1
                     self.__send_flag(fl_ack=True)
                     self.__goto_state(tcp_state.TIME_WAIT)
+                else:
+                    self.__goto_state(tcp_state.CLOSED)
+                    self.__send_reset()
                     break
+
             elif self.state == tcp_state.CLOSING:
                 if rp.fl_ack:
                     self.__goto_state(tcp_state.TIME_WAIT)
+                else:
+                    self.__goto_state(tcp_state.CLOSED)
+                    self.__send_reset()
                     break
+
             elif self.state == tcp_state.TIME_WAIT:
-                # todo: wait for 2MSL
-                self.__send_reset()
+                break
+
             else:
+                self.__goto_state(tcp_state.CLOSED)
                 self.__send_reset()
 
     def __send_reset(self):
@@ -308,6 +405,7 @@ class tcpea:
         # print("Sending flag")
         # if fl_fin:
         #     self.seq += 1
+        print("flg ", self.src_ip.to_str(), self.dst_ip.to_str())
         fl_tcp = tcp_packet.to_raw(src_ip=self.src_ip, src_port=self.src_port, dst_ip=self.dst_ip,
                                    dst_port=self.dst_port, seq_no=self.seq, ack_no=self.ack, window=0xfaf0,
                                    fl_rst=fl_rst, fl_ack=fl_ack, fl_push=fl_push, fl_syn=fl_syn, fl_fin=fl_fin,
@@ -336,3 +434,4 @@ class tcpea:
         # workaround to stop the loop thread
         # send_to(self.soc, self.src_ip, 0, bytes())
         self.soc.close()
+        raise REMOTE_CLOSED
