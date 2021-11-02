@@ -1,6 +1,6 @@
 # tcpea - A User Space Network Stack
 
-tcpea is written in Python and does have any external dependencies.
+tcpea is written in Python and does not have any external dependencies.
 
 Working -
 * TCP client
