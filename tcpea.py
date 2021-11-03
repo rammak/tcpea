@@ -12,8 +12,12 @@ import time
 
 from tcpea_common import *
 
+class ip_proto(enum.IntEnum):
+    ICMP = 0x01
+    TCP = 0x06
+    UDP = 0x11
 
-class tcp_state(enum.Enum):
+class tcp_state(enum.IntEnum):
     CLOSED = 0
     LISTEN = 1
     SYN_SENT = 2
@@ -39,10 +43,10 @@ class REMOTE_CLOSED(Exception):
 class ip_packet:
     src_ip: ipv4_address = None
     dst_ip: ipv4_address = None
-    proto: int = 0
+    proto: ip_proto = 0
     payload: bytes = None
 
-    def __init__(self, src_address: ipv4_address, dst_address: ipv4_address, payload: bytes, proto=6):
+    def __init__(self, src_address: ipv4_address, dst_address: ipv4_address, payload: bytes, proto: ip_proto = 6):
         self.src_ip = src_address
         self.dst_ip = dst_address
         self.proto = proto
@@ -50,10 +54,11 @@ class ip_packet:
 
     @classmethod
     def from_raw(cls, raw_packet: bytes):
-        return cls(ipv4_address.from_ip(raw_packet[12:16]), ipv4_address.from_ip(raw_packet[16:20]), raw_packet[20:])
+        return ip_packet(ipv4_address(raw_packet[12:16]), ipv4_address(raw_packet[16:20]), raw_packet[20:],
+                         proto=ip_proto(raw_packet[9]))
 
     @classmethod
-    def to_raw(cls, src_address: ipv4_address, dst_address: ipv4_address, payload: bytes, proto: int = 6,
+    def to_raw(cls, src_address: ipv4_address, dst_address: ipv4_address, payload: bytes, proto: ip_proto = 6,
                pac_id: int = random.randint(0, 0xffff), fl_df: bool = False, ttl: int = 128):
         header = bytearray([0x45, 0x00, (len(payload) + 20) >> 8, (len(payload) + 20) & 0xff, (pac_id >> 8),
                             (pac_id & 0xff), (fl_df << 6), 0x00, ttl, proto, 0x00, 0x00,
@@ -122,7 +127,6 @@ class tcp_packet:
     def to_raw(cls, src_ip: ipv4_address, dst_ip: ipv4_address, src_port: int, dst_port: int, seq_no: int, ack_no: int,
                window: int, payload: bytes, fl_ack: bool = False, fl_syn: bool = False, fl_rst: bool = False,
                fl_fin: bool = False, fl_push: bool = False, opt_mss=None, opt_wscale=None):
-        print("hsh ", src_ip.to_str(), dst_ip.to_str())
         header_length = 5
         options = []
         if opt_wscale is not None:
@@ -149,6 +153,119 @@ class tcp_packet:
         header[16] = cksm >> 8
         header[17] = cksm & 0xff
         return header + payload
+
+
+class arp_packet:
+    REQUEST = 1
+    REPLY = 2
+    op: int = None
+    sha: eth_address = None
+    tha: eth_address = None
+    spa: ipv4_address = None
+    tpa: ipv4_address = None
+    base = bytes([0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00])
+
+    def __init__(self, operation: int, sha: eth_address, tha: eth_address, spa: ipv4_address, tpa: ipv4_address):
+        self.op = operation
+        self.sha = sha
+        self.tha = tha
+        self.spa = spa
+        self.tpa = tpa
+
+    @classmethod
+    def to_raw(cls, operation: int, sha: eth_address, tha: eth_address, spa: ipv4_address, tpa: ipv4_address):
+        return arp_packet.base + bytes([operation]) + sha.eth + spa.ip + tha.eth + tpa.ip
+
+    @classmethod
+    def from_raw(cls, data: bytes):
+        return arp_packet(operation=data[7], sha=eth_address(data[8:14]), spa=ipv4_address(data[14:18]),
+                          tha=eth_address(data[18:24]), tpa=ipv4_address(data[24:]))
+
+
+# class icmp_packet:
+#     src_ip: ipv4_address = None
+#     dst_ip: ipv4_address = None
+#
+
+class arpea:
+    mac: eth_address = None
+    ip: ipv4_address = None
+    mac_table: dict = {}
+
+    def __init__(self, mac_address: eth_address, ip_address: ipv4_address):
+        self.mac = mac_address
+        self.ip = ip_address
+
+    def update(self, packet: arp_packet):
+        if packet.op == arp_packet.REQUEST and packet.tpa.to_str() == self.ip.to_str():
+            if packet.spa.to_str() not in self.mac_table.keys():
+                self.mac_table[packet.spa.to_str()] = packet.sha.to_str()
+            return arp_packet.to_raw(operation=arp_packet.REPLY, sha=self.mac, spa=self.ip,
+                                     tha=packet.sha, tpa=packet.spa)
+        elif packet.op == arp_packet.REPLY:
+            if packet.spa.to_str() not in self.mac_table.keys():
+                self.mac_table[packet.spa.to_str()] = packet.sha.to_str()
+            return None
+
+    def query(self, ip_address: ipv4_address):
+        if ip_address.to_str() in self.mac_table.keys():
+            return eth_address.from_str(self.mac_table[ip_address.to_str()])
+        else:
+            return None
+
+
+class ipea:
+    ip: ipv4_address = None
+    mac: eth_address = None
+    eth: ethernet = None
+    interface: str = None
+    arp: arpea = None
+
+    __rt: threading.Thread = None
+
+    def __init__(self, ip_address: str, mac_address: str, interface: str):
+        self.ip = ipv4_address.from_str(ip_address)
+        self.mac = eth_address.from_str(mac_address)
+        self.interface = interface
+        self.arp = arpea(mac_address=self.mac, ip_address=self.ip)
+
+        self.eth = ethernet(mac_address=self.mac, interface=self.interface)
+        self.eth.register_protocol(ether_type.ARP)
+        self.eth.register_protocol(ether_type.IPV4)
+        self.__rt = threading.Thread(target=self.__receive_loop)
+        self.__rt.start()
+
+    def __receive_loop(self):
+        while True:
+            fr = self.eth.receive()
+            if fr is not None:
+                if fr[1] == ether_type.ARP:
+                    ap = arp_packet.from_raw(data=fr[0][14:])
+                    ret = self.arp.update(ap)
+                    if ret is not None:
+                        self.eth.send(eth_frame.to_raw(src_mac=self.mac, dst_mac=ap.sha, payload=ret,
+                                                       proto=ether_type.ARP))
+                elif fr[1] == ether_type.IPV4:
+                    ipp = ip_packet.from_raw(fr[0][14:])
+                    if ipp.proto == ip_proto.ICMP and ipp.payload[0] == 0x08:
+                        ping_reply = bytes([0, 0, 0, 0]) + ipp.payload[4:]
+                        cksm = ipv4_checksum(ping_reply)
+                        ping_reply = bytes([0, 0, cksm >> 8, cksm & 0xff]) + ipp.payload[4:]
+                        self.send(dst_ip=ipp.src_ip, proto=ip_proto.ICMP, payload=ping_reply)
+
+    def send(self, dst_ip: ipv4_address, proto: ip_proto, payload: bytes):
+        dest = self.arp.query(dst_ip)
+        if dest is not None:
+            self.eth.send(eth_frame.to_raw(src_mac=self.mac, dst_mac=dest, proto=ether_type.IPV4,
+                            payload=ip_packet.to_raw(src_address=self.ip, dst_address=dst_ip,
+                                                     payload=payload, proto=proto)))
+        else:
+            # todo: check if own subnet or other subnet
+            self.eth.send(eth_frame.to_raw(src_mac=self.mac, dst_mac=eth_address.from_str("ff:ff:ff:ff:ff:ff"),
+                                           proto=ether_type.ARP,
+                                           payload=arp_packet.to_raw(operation=arp_packet.REQUEST, spa=self.ip,
+                                                                     sha=self.mac, tpa=dst_ip,
+                                                                     tha=eth_address.from_str("00:00:00:00:00:00"))))
 
 
 class tcpea:
